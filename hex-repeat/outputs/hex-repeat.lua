@@ -1,6 +1,6 @@
 -- Hex Repeat. Штатные инструменты редактируют исходный слой.
 -- Шесть копий хранятся в отдельном заблокированном служебном слое.
-local Hex = {}
+local Hex = { version="1.1" }
 
 local function alive(sprite)
   if not sprite then return false end
@@ -288,6 +288,9 @@ local function putDerived(cel, image)
   assert(cel.image.width==image.width and cel.image.height==image.height,
     "Размер служебного слоя изменился. Выключи и снова включи режим.")
   cel.image.bytes=image.bytes
+  -- Уведомляем окна документа, включая Preview, не меняя видимость и историю Undo.
+  local layer=cel.layer
+  layer.isVisible=layer.isVisible
 end
 
 -- Не снимаем выделение, если пользователь уже заменил его собственным.
@@ -1044,7 +1047,7 @@ dialog:newrow()
 dialog:button{ text="Вернуть маску", onclick=function() restoreRequested=true end }
 dialog:button{ text="Обновить", onclick=function() refreshRequested=true end }
 dialog:newrow()
-dialog:button{ text="Закрыть", onclick=function() dialog:close() end }
+dialog:button{ text="Закрыть", label="Версия "..Hex.version, onclick=function() dialog:close() end }
 
 -- Таймер обновляет только представление и контроллер, после событий документа.
 timer = Timer{ interval=0.1, ontick=function()
