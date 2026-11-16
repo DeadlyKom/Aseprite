@@ -1,6 +1,6 @@
 -- Hex Repeat. Штатные инструменты редактируют исходный слой.
 -- Шесть копий хранятся в отдельном заблокированном служебном слое.
-local Hex = { version="1.1" }
+local Hex = { version="1.2" }
 
 local function alive(sprite)
   if not sprite then return false end
@@ -311,7 +311,7 @@ end
 -- Контроллер не зависит от окна и проверяется на нативных документах Aseprite.
 function Hex.controller()
   local self = { enabled=false, closed=false, dirty=false, events=0,
-    snapshots=0, tile=nil, error=nil, message="Выдели гекс и включи режим.", sessions={} }
+    snapshots=0, tile=nil, error=nil, message="Выдели гекс и включи режим.", sessions={}, suspended={} }
   self.geometry, self.repeatOn = Hex.geometry(24,12,14), true
   self.gridOn=true
   self.gridOpacity,self.gridSolid=50,false
@@ -544,10 +544,10 @@ function Hex.controller()
     if saveListener then app.events:off(saveListener);saveListener=nil end
   end
 
-  function self.disable()
+  function self.disable(keepMask)
     blankCopies()
     self.enabled = false
-    if binding and alive(binding.sprite) then
+    if not keepMask and binding and alive(binding.sprite) then
       pcall(function()
         if binding.sprite.undoHistory.redoSteps==0
           and sameSelection(binding.sprite.selection, editingMask(binding.neighbors)) then
@@ -562,6 +562,52 @@ function Hex.controller()
     self.message = "Режим выключен. Выбери слой."
   end
 
+  -- Повторно используем подписки после возврата, не создавая слои и шаги Undo.
+  local function attachBindingEvents()
+    local sprite,layer=binding.sprite,binding.layer
+    changeListener = sprite.events:on("change", function()
+      if not self.closed then
+        self.events = self.events + 1
+        -- Undo/Redo возвращает режимы и сохранённые рисунки вместе с исходным cel.
+        binding.neighbors,binding.records=readNeighbors(metadata(binding.copies),binding.frame)
+        self.neighborModes=binding.neighbors.modes
+        local ok,tile=pcall(Hex.captureNative,sprite,layer,binding.frame,binding.mask)
+        if ok then self.pendingTile=tile;self.dirty=true
+        else self.error="Не удалось прочитать рисунок. Нажми «Обновить»." end
+      end
+    end)
+    saveListener=app.events:on("beforecommand",function(ev)
+      if self.enabled and ev and (ev.name=="SaveFile" or ev.name=="SaveFileAs"
+        or ev.name=="SaveFileCopyAs" or ev.name=="ExportSpriteSheet") then
+        local ok,problem=pcall(function()self.flush(true)end)
+        if not ok then self.disable();self.error=tostring(problem) end
+      end
+    end)
+  end
+
+  local function currentBinding(candidate)
+    local ok,active=pcall(function()
+      return app.sprite==candidate.sprite and app.layer==candidate.layer
+        and app.frame and app.frame.frameNumber==candidate.frame
+        and candidate.layer.isEditable and candidate.layer.isVisible
+        and candidate.sprite.width==candidate.width and candidate.sprite.height==candidate.height
+        and candidate.copies:cel(candidate.frame)~=nil and candidate.grid:cel(candidate.frame)~=nil
+        and candidate.layer.opacity==candidate.opacity and candidate.layer.blendMode==candidate.blend
+        and candidate.layer.parent==candidate.parent
+        and (candidate.layer:cel(candidate.frame) and candidate.layer:cel(candidate.frame).opacity or 255)==candidate.celOpacity
+    end)
+    return ok and active
+  end
+
+  function self.suspend()
+    if not self.enabled or not binding then return end
+    local saved={binding=binding,geometry=self.geometry,repeatOn=self.repeatOn,
+      gridOn=self.gridOn,gridOpacity=self.getGridOpacity(),gridSolid=self.getGridSolid()}
+    self.disable(true)
+    self.suspended[#self.suspended+1]=saved
+    self.message="Режим приостановлен на другом холсте."
+  end
+
   function self.enable(geometry)
     assert(not self.closed, "Панель уже закрыта.")
     local sprite, layer, frame = app.sprite, app.layer, app.frame
@@ -569,6 +615,10 @@ function Hex.controller()
     local requestedMask
     if not sprite.selection.isEmpty then requestedMask=Selection();requestedMask:add(sprite.selection) end
     self.disable()
+    -- Явное включение заменяет прежнюю приостановленную работу на этом документе.
+    for i=#self.suspended,1,-1 do
+      if self.suspended[i].binding.sprite==sprite then table.remove(self.suspended,i) end
+    end
     assert(layer and not layer.isGroup and not layer.isTilemap and not layer.isReference,
       "Выбери обычный растровый слой.")
     assert(not metadata(layer),"Выбери исходный слой, а не служебные копии.")
@@ -637,31 +687,45 @@ function Hex.controller()
     self.neighborModes=neighbors.modes
     local prepared,problem=pcall(prepareCopies)
     if not prepared then detach();error(problem,0) end
-    -- Снимаем готовый рисунок после изменения, пока кисть не начала следующую операцию.
-    -- В обработчике только чтение, без изменения окна, маски и производного слоя.
-    changeListener = sprite.events:on("change", function()
-      if not self.closed then
-        self.events = self.events + 1
-        -- Undo/Redo возвращает режимы и сохранённые рисунки вместе с исходным cel.
-        binding.neighbors,binding.records=readNeighbors(metadata(binding.copies),binding.frame)
-        self.neighborModes=binding.neighbors.modes
-        local ok,tile=pcall(Hex.captureNative,sprite,layer,binding.frame,binding.mask)
-        if ok then self.pendingTile=tile;self.dirty=true
-        else self.error="Не удалось прочитать рисунок. Нажми «Обновить»." end
-      end
-    end)
+    -- Снимаем готовый рисунок после изменения, обработчик только читает документ.
+    attachBindingEvents()
     self.pendingTile=Hex.captureNative(sprite,layer,binding.frame,binding.mask)
-    -- Штатное сохранение читает свежие копии даже до следующего тика таймера.
-    saveListener=app.events:on("beforecommand",function(ev)
-      if self.enabled and ev and (ev.name=="SaveFile" or ev.name=="SaveFileAs"
-        or ev.name=="SaveFileCopyAs" or ev.name=="ExportSpriteSheet") then
-        local ok,problem=pcall(function()self.flush(true)end)
-        if not ok then self.disable();self.error=tostring(problem) end
-      end
-    end)
     self.enabled, self.dirty, self.error = true, true, nil
     self.sourceName = layer.name
     self.message = "Рисуй на основном холсте."
+  end
+
+  function self.resume()
+    if self.enabled or self.closed then return false end
+    for i=#self.suspended,1,-1 do
+      local saved=self.suspended[i]
+      local candidate=saved.binding
+      if not alive(candidate.sprite) then table.remove(self.suspended,i)
+      elseif app.sprite==candidate.sprite and app.layer==candidate.layer
+        and app.frame and app.frame.frameNumber==candidate.frame then
+        table.remove(self.suspended,i)
+        -- Изменённый холст, удалённые слои и отменённую подготовку не восстанавливаем.
+        if not currentBinding(candidate) then return false end
+        local ok,tile,neighbors,records=pcall(function()
+          local n,r=readNeighbors(metadata(candidate.copies),candidate.frame)
+          return Hex.captureNative(candidate.sprite,candidate.layer,candidate.frame,candidate.mask),n,r
+        end)
+        if not ok then self.error="Не удалось восстановить Hex Repeat. Включи режим вручную.";return false end
+        binding=candidate
+        self.geometry,self.repeatOn=saved.geometry,saved.repeatOn
+        self.gridOn,self.gridOpacity,self.gridSolid=saved.gridOn,saved.gridOpacity,saved.gridSolid
+        binding.neighbors,binding.records=neighbors,records
+        self.neighborModes=neighbors.modes
+        self.pendingTile,self.tile,self.lastBytes=tile,nil,nil
+        self.copies,self.grid,self.sourceName=binding.copies,binding.grid,binding.layer.name
+        self.renderedGrid,self.renderedGridId=nil,nil
+        attachBindingEvents()
+        self.enabled,self.dirty,self.error=true,true,nil
+        self.message="Режим восстановлен. Рисуй на холсте."
+        return true
+      end
+    end
+    return false
   end
 
   function self.flush(poll)
@@ -672,18 +736,8 @@ function Hex.controller()
       self.message = "Открой холст и включи режим."
       return false
     end
-    local ok, active = pcall(function()
-      return app.sprite == binding.sprite and app.layer == binding.layer
-        and app.frame and app.frame.frameNumber == binding.frame
-        and binding.layer.isEditable and binding.layer.isVisible
-        and binding.sprite.width==binding.width and binding.sprite.height==binding.height
-        and binding.copies:cel(binding.frame)~=nil
-        and binding.grid:cel(binding.frame)~=nil
-        and binding.layer.opacity==binding.opacity and binding.layer.blendMode==binding.blend
-        and binding.layer.parent==binding.parent
-        and (binding.layer:cel(binding.frame) and binding.layer:cel(binding.frame).opacity or 255)==binding.celOpacity
-    end)
-    if not ok or not active then
+    if app.sprite~=binding.sprite then self.suspend();return false end
+    if not currentBinding(binding) then
       self.disable()
       self.message = "Холст или слой сменился. Включи режим."
       return false
@@ -825,6 +879,7 @@ function Hex.controller()
     self.disable()
     self.closed = true
     self.sessions = {}
+    self.suspended = {}
   end
   return self
 end
@@ -1099,6 +1154,17 @@ timer = Timer{ interval=0.1, ontick=function()
       if not run(function() controller.flush(dialog.data.poll or ticks % 10 == 0) end,false) then
         controller.disable()
       end
+    end
+    if not controller.enabled then
+      run(function()
+        if controller.resume() then
+          controller.flush(true)
+          if controller.enabled then
+            dialog:modify{id="repeatOn",selected=controller.repeatOn}
+            dialog:modify{id="gridOn",selected=controller.gridOn}
+          end
+        end
+      end,false)
     end
     -- Не стираем нативное нажатие между MouseDown и onclick очередным тиком таймера.
     if modeNeedsSync or displayedMode~=controller.enabled then
