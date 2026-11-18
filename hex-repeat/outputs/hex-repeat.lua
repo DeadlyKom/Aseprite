@@ -1,11 +1,60 @@
 -- Hex Repeat. Штатные инструменты редактируют исходный слой.
 -- Шесть копий хранятся в отдельном заблокированном служебном слое.
-local Hex = { version="1.2" }
+local Hex = { version="1.5" }
 
 local function alive(sprite)
   if not sprite then return false end
   local ok, valid = pcall(function() return sprite.isValid end)
   return ok and valid == true
+end
+
+-- Читаем только старые документы 1.3, в которых точный контур не сохранялся.
+local function legacyHexMask(cell,sprite)
+  local b=Rectangle(cell)
+  assert(b.width>0 and b.height>0 and b.width*b.height<=1048576,
+    "Размер ячейки должен быть положительным, область — не больше 1048576 пикселей.")
+  assert(b.x>=0 and b.y>=0 and b.x+b.width<=sprite.width and b.y+b.height<=sprite.height,
+    "Прямоугольник ячейки должен находиться внутри холста.")
+  local shape,rows=Selection(),{}
+  for y=0,b.height-1 do
+    -- Рассчитываем скос по центру строки пикселей, без шаблона фиксированного размера.
+    local edge=math.min(y+0.5,b.height-y-0.5)
+    local inset=math.max(0,math.ceil(b.width/2*(1-edge/(b.height/4))))
+    inset=math.min(inset,math.floor((b.width-1)/2))
+    local row={}
+    for x=inset,b.width-inset-1 do row[#row+1]=x end
+    rows[y+1]=row
+    shape:add(Rectangle(b.x+inset,b.y+y,b.width-2*inset,1))
+  end
+  return {selection=shape,bounds=b,rows=rows}
+end
+
+function Hex.sizeGeometry(cell,overlap)
+  assert(type(overlap)=="number" and overlap==math.floor(overlap) and overlap>=0 and overlap<=7,
+    "Наложение по вертикали должно быть целым числом от 0 до 7 пикселей.")
+  assert(overlap<cell.height,"Наложение должно быть меньше высоты ячейки.")
+  return Hex.geometry(cell.width,math.floor(cell.width/2+0.5),cell.height-overlap)
+end
+
+-- Подбираем стык по наружному контуру, не изменяя ни одного пикселя маски.
+function Hex.defaultOverlap(mask)
+  local b=mask.bounds
+  local rowX=math.floor(b.width/2+0.5)
+  local tops,bottoms={},{}
+  for y,row in ipairs(mask.rows) do
+    for _,x in ipairs(row) do
+      tops[x]=tops[x] or y-1
+      bottoms[x]=y-1
+    end
+  end
+  -- Для обеих диагоналей ищем наибольший шаг Y без пустой строки между контурами.
+  local rowY=b.height
+  for x=0,b.width-rowX-1 do
+    if tops[x] and tops[x+rowX] then
+      rowY=math.min(rowY,bottoms[x]-tops[x+rowX]+1,bottoms[x+rowX]-tops[x]+1)
+    end
+  end
+  return math.max(0,math.min(7,b.height-1,b.height-rowY))
 end
 
 -- Сохраняем точные пиксели выделения, не восстанавливая геометрию по размерам.
@@ -29,6 +78,17 @@ function Hex.mask(selection, sprite)
     end
   end
   return { selection=copy, bounds=Rectangle(bounds), rows=rows }
+end
+
+-- Восстанавливаем пользовательские пиксели контура, включая вырезы и отверстия.
+local function storedMask(data,cell,sprite)
+  if not data.rows then return legacyHexMask(cell,sprite) end
+  local shape=Selection()
+  for y=1,#data.rows do
+    local row=data.rows[y]
+    for i=1,#row do shape:add(Rectangle(cell.x+row[i],cell.y+y-1,1,1)) end
+  end
+  return Hex.mask(shape,sprite)
 end
 
 -- Выбираем палитру текущего кадра, не меняя палитру документа.
@@ -312,7 +372,8 @@ end
 function Hex.controller()
   local self = { enabled=false, closed=false, dirty=false, events=0,
     snapshots=0, tile=nil, error=nil, message="Выдели гекс и включи режим.", sessions={}, suspended={} }
-  self.geometry, self.repeatOn = Hex.geometry(24,12,14), true
+  self.geometry, self.repeatOn = Hex.geometry(1,1,1), true
+  self.overlap=0
   self.gridOn=true
   self.gridOpacity,self.gridSolid=50,false
   self.neighborModes=emptyNeighbors().modes
@@ -352,12 +413,6 @@ function Hex.controller()
   local function saveMask(state)
     state=state or binding.neighbors
     local m=binding.mask
-    local rows={}
-    for _,row in ipairs(m.rows) do
-      local pixels={}
-      for _,x in ipairs(row) do pixels[#pixels+1]=x end
-      rows[#rows+1]=pixels
-    end
     local cel=binding.copies:cel(binding.frame)
     local records={}
     for _,entry in ipairs(binding.records) do
@@ -366,8 +421,9 @@ function Hex.controller()
     records[#records+1]={frame=binding.frame,payload=json.encode(state)}
     binding.copies.data=marker..json.encode{source=tostring(binding.layer.uuid),
       frame=binding.frame, x=m.bounds.x-cel.position.x, y=m.bounds.y-cel.position.y,
-      width=m.bounds.width,height=m.bounds.height,rows=rows,
+      width=m.bounds.width,height=m.bounds.height,model="custom-mask",rows=m.rows,overlap=self.overlap,
       stepX=self.geometry.stepX,rowX=self.geometry.rowX,rowY=self.geometry.rowY,neighbors=records}
+    binding.records=records
   end
 
   local function prepareCopies()
@@ -446,40 +502,123 @@ function Hex.controller()
     self.renderedGrid,self.renderedGridId=nil,nil
   end
 
-  function self.canConfigure()
-    if not self.enabled then return true end
-    for _,draw in ipairs(self.neighborModes) do if draw then return false end end
-    for _,entry in ipairs(binding.records) do
-      local state=json.decode(entry.payload)
-      for i=1,6 do if state.modes[i] then return false end end
-    end
-    return true
-  end
-
-  function self.configure(geometry)
-    local previous=self.geometry
-    local nextGeometry=Hex.geometry(geometry.stepX,geometry.rowX,geometry.rowY)
-    if previous.stepX==nextGeometry.stepX and previous.rowX==nextGeometry.rowX
-      and previous.rowY==nextGeometry.rowY then return end
-    if self.enabled then
-      for _,entry in ipairs(binding.records) do
-        local state=json.decode(entry.payload)
-        for i=1,6 do
-          assert(not state.modes[i],"Перед изменением смещений переключи DRAW в REPEAT во всех кадрах. Рисунки сохранятся.")
+  local function copiesImage(tile,output)
+    local image=transparentImage(binding.sprite,output.image.width,output.image.height)
+    if self.repeatOn then
+      local g,m=self.geometry,binding.mask
+      for i,p in ipairs(offsets(g)) do
+        if not binding.neighbors.modes[i] then
+          image:drawImage(tile,Point(m.bounds.x+p[1]-output.position.x,m.bounds.y+p[2]-output.position.y))
         end
       end
-      for _,draw in ipairs(self.neighborModes) do
-        assert(not draw,"Перед изменением смещений переключи клетки DRAW в REPEAT. Рисунки сохранятся.")
+      -- Копии не заполняют прозрачность центра и самостоятельных клеток.
+      local clear=binding.sprite.colorMode==ColorMode.INDEXED and binding.sprite.transparentColor or 0
+      local function clearMask(mask)
+        for y,row in ipairs(mask.rows) do
+          for _,x in ipairs(row) do image:drawPixel(mask.bounds.x+x-output.position.x,
+            mask.bounds.y+y-1-output.position.y,clear) end
+        end
+      end
+      clearMask(m)
+      for i,p in ipairs(offsets(g)) do
+        if binding.neighbors.modes[i] then clearMask(neighborMask(m,p)) end
       end
     end
-    self.geometry=nextGeometry
+    return image
+  end
+
+  -- Меняем расстояния вместе с рисунками DRAW, сохраняя общий исходный фон ячеек.
+  local function applyLayout(mask,geometry,overlap)
+    local sprite,source,frame=binding.sprite,binding.layer,binding.frame
+    local oldMask,oldGeometry=binding.mask,self.geometry
+    local frames,seen={},{}
+    local data=metadata(binding.copies)
+    local function collect(number)
+      if number<1 or number>#sprite.frames then return end
+      if seen[number] then return end
+      seen[number]=true
+      local state=readNeighbors(data,number)
+      local item={frame=number,state=state,modes={},tiles={}}
+      for i,p in ipairs(offsets(oldGeometry)) do
+        item.modes[i]=state.modes[i]
+        if state.modes[i] then
+          local region=neighborMask(oldMask,p)
+          item.tiles[i]=Hex.captureNative(sprite,source,number,region)
+          assert(state.bases[i]~="","Нет сохранённого исходного фона самостоятельной клетки.")
+          decodedImage(sprite,region,state.bases[i])
+        end
+      end
+      frames[#frames+1]=item
+    end
+    collect(frame)
+    for _,record in ipairs(binding.records) do collect(record.frame) end
+    local area=Hex.footprint(mask,geometry)
+    assert(area.width*area.height<=16777216,"Область повторов слишком велика.")
+    app.transaction("Hex Repeat: размер и наложение сетки",function()
+      -- Снимаем все самостоятельные клетки со старых мест, не меняя центральный рисунок.
+      for _,item in ipairs(frames) do
+        for i,p in ipairs(offsets(oldGeometry)) do
+          if item.modes[i] then
+            local region=neighborMask(oldMask,p)
+            item.state.drawings[i]=encodedImage(item.tiles[i])
+            replaceRegion(sprite,source,item.frame,region,
+              decodedImage(sprite,region,item.state.bases[i]),oldMask.selection)
+          end
+        end
+      end
+      self.geometry,self.overlap=geometry,overlap
+      binding.mask=mask
+      binding.maskRows=json.encode(mask.rows)
+      for _,session in ipairs(self.sessions) do
+        if session.sprite==sprite and session.layer==source then session.mask=mask end
+      end
+      -- Подготовка переносит все слои при необходимом расширении холста.
+      binding.neighbors=frames[1].state
+      prepareCopies()
+      for _,item in ipairs(frames) do
+        binding.frame,binding.neighbors=item.frame,item.state
+        local state=item.state
+        state.modes=emptyNeighbors().modes
+        state.bases=emptyNeighbors().bases
+        -- Сохраняем фон всех новых мест до размещения первого DRAW.
+        for i,p in ipairs(offsets(geometry)) do
+          state.bases[i]=encodedImage(Hex.captureNative(sprite,source,item.frame,neighborMask(mask,p)))
+        end
+        for i,p in ipairs(offsets(geometry)) do
+          if item.modes[i] then
+            replaceRegion(sprite,source,item.frame,neighborMask(mask,p),item.tiles[i],editingMask(state).selection)
+            state.modes[i]=true
+          end
+        end
+        self.neighborModes=state.modes
+        prepareCopies()
+        local output=binding.copies:cel(item.frame)
+        output.image=copiesImage(Hex.captureNative(sprite,source,item.frame,mask),output)
+      end
+      binding.frame=frame
+      for _,item in ipairs(frames) do if item.frame==frame then binding.neighbors=item.state end end
+      self.neighborModes=binding.neighbors.modes
+      local sourceCel=source:cel(frame)
+      binding.celOpacity=sourceCel and sourceCel.opacity or 255
+      app.layer=source;app.frame=frame
+      saveMask()
+      sprite.selection=editingMask(binding.neighbors).selection
+    end)
+    self.pendingTile=Hex.captureNative(sprite,source,frame,binding.mask)
+    self.dirty=true
+  end
+
+  function self.setOverlap(value)
     if self.enabled then
-      if app.sprite~=binding.sprite or app.layer~=binding.layer then self.disable();return end
-      local bases=binding.neighbors.bases
-      binding.neighbors.bases=emptyNeighbors().bases
-      local ok,problem=pcall(prepareCopies)
-      if not ok then binding.neighbors.bases=bases;self.geometry=previous;error(problem,0) end
-      self.dirty=true
+      assert(app.sprite==binding.sprite and app.layer==binding.layer,"Выбери исходный слой.")
+      local geometry=Hex.sizeGeometry(binding.mask.bounds,value)
+      if value~=self.overlap then
+        applyLayout(binding.mask,geometry,value)
+      end
+    else
+      assert(type(value)=="number" and value==math.floor(value) and value>=0 and value<=7,
+        "Наложение по вертикали должно быть от 0 до 7 пикселей.")
+      self.overlap,self.overlapOverride=value,value
     end
   end
 
@@ -568,8 +707,28 @@ function Hex.controller()
     changeListener = sprite.events:on("change", function()
       if not self.closed then
         self.events = self.events + 1
+        local data=metadata(binding.copies)
+        local maskRows=data and data.rows and json.encode(data.rows)
+        -- Undo/Redo наложения возвращает параметры маски вместе с документом.
+        if data and data.overlap~=nil and (data.overlap~=self.overlap
+          or maskRows~=binding.maskRows
+          or data.width~=binding.mask.bounds.width or data.height~=binding.mask.bounds.height) then
+          local cel=binding.copies:cel(binding.frame)
+          if cel then
+            binding.mask=storedMask(data,Rectangle(cel.position.x+data.x,cel.position.y+data.y,
+              data.width,data.height),sprite)
+            self.overlap=data.overlap
+            binding.maskRows=maskRows
+            self.geometry=Hex.sizeGeometry(binding.mask.bounds,self.overlap)
+            self.cellWidth,self.cellHeight=data.width,data.height
+            binding.width,binding.height=sprite.width,sprite.height
+            for _,session in ipairs(self.sessions) do
+              if session.sprite==sprite and session.layer==layer then session.mask=binding.mask end
+            end
+          end
+        end
         -- Undo/Redo возвращает режимы и сохранённые рисунки вместе с исходным cel.
-        binding.neighbors,binding.records=readNeighbors(metadata(binding.copies),binding.frame)
+        binding.neighbors,binding.records=readNeighbors(data,binding.frame)
         self.neighborModes=binding.neighbors.modes
         local ok,tile=pcall(Hex.captureNative,sprite,layer,binding.frame,binding.mask)
         if ok then self.pendingTile=tile;self.dirty=true
@@ -601,14 +760,14 @@ function Hex.controller()
 
   function self.suspend()
     if not self.enabled or not binding then return end
-    local saved={binding=binding,geometry=self.geometry,repeatOn=self.repeatOn,
+    local saved={binding=binding,geometry=self.geometry,overlap=self.overlap,repeatOn=self.repeatOn,
       gridOn=self.gridOn,gridOpacity=self.getGridOpacity(),gridSolid=self.getGridSolid()}
     self.disable(true)
     self.suspended[#self.suspended+1]=saved
     self.message="Режим приостановлен на другом холсте."
   end
 
-  function self.enable(geometry)
+  function self.enable()
     assert(not self.closed, "Панель уже закрыта.")
     local sprite, layer, frame = app.sprite, app.layer, app.frame
     assert(alive(sprite), "Открой холст и выбери слой.")
@@ -635,13 +794,8 @@ function Hex.controller()
     local persistedMask
     if copies and data and (copies:cel(frame) or copies:cel(data.frame)) then
       local cel=copies:cel(frame) or copies:cel(data.frame)
-      local shape=Selection()
-      for y=1,#data.rows do
-        local row=data.rows[y]
-        for i=1,#row do shape:add(Rectangle(cel.position.x+data.x+row[i],
-          cel.position.y+data.y+y-1,1,1)) end
-      end
-      persistedMask=Hex.mask(shape,sprite)
+      local cell=Rectangle(cel.position.x+data.x,cel.position.y+data.y,data.width,data.height)
+      persistedMask=storedMask(data,cell,sprite)
     end
     -- Не принимаем собственное объединённое выделение за новую центральную клетку.
     if requestedMask and saved then
@@ -659,34 +813,49 @@ function Hex.controller()
       end
       if sameSelection(requestedMask,{selection=union,bounds=union.bounds}) then requestedMask=nil end
     end
-    if requestedMask and persistedMask and not sameSelection(requestedMask,persistedMask) then
+    local cell=requestedMask and Rectangle(requestedMask.bounds)
+      or (persistedMask and Rectangle(persistedMask.bounds))
+      or (saved and Rectangle(saved.mask.bounds))
+    if persistedMask and (cell.x~=persistedMask.bounds.x or cell.y~=persistedMask.bounds.y
+      or cell.width~=persistedMask.bounds.width or cell.height~=persistedMask.bounds.height) then
       for _,entry in ipairs(records) do
         local state=json.decode(entry.payload)
         for i=1,6 do
           assert(not state.modes[i] and state.drawings[i]=="",
-            "У слоя есть самостоятельные клетки. Для другой центральной маски используй новый исходный слой.")
+            "У слоя есть самостоятельные клетки. Для другого размера или положения ячейки используй новый исходный слой.")
         end
       end
     end
-    local mask
-    if requestedMask then
-      mask = Hex.mask(requestedMask, sprite)
-    elseif saved then
-      mask = Hex.mask(saved.mask.selection, sprite)
-    elseif persistedMask then
-      mask=persistedMask
-    else
-      error("Выдели точную форму одного гекса.", 0)
+    -- Новую форму берём только из выделения, сохранённую восстанавливаем без изменений.
+    local mask=requestedMask and Hex.mask(requestedMask,sprite) or persistedMask or (saved and saved.mask)
+    assert(mask,"Выдели точную форму одного гекса. Без выделения можно восстановить только сохранённую маску.")
+    cell=mask.bounds
+    local overlap=self.overlapOverride
+    if overlap==nil then
+      if data and data.overlap~=nil then overlap=data.overlap
+      elseif data then overlap=math.max(0,math.min(7,cell.height-data.rowY,cell.height-1))
+      else overlap=Hex.defaultOverlap(mask) end
     end
-    if saved then saved.mask = mask
-    else self.sessions[#self.sessions + 1] = { sprite=sprite, layer=layer, mask=mask } end
-    self.geometry=geometry or (data and Hex.geometry(data.stepX,data.rowX,data.rowY))
-      or Hex.geometry(mask.bounds.width,self.geometry.rowX,self.geometry.rowY)
-    binding = { sprite=sprite, layer=layer, frame=frame.frameNumber, mask=mask,copies=copies,
+    local geometry=Hex.sizeGeometry(cell,overlap)
+    local previousGeometry=data and Hex.geometry(data.stepX,data.rowX,data.rowY)
+    local migrate=persistedMask and (not sameSelection(mask.selection,persistedMask)
+      or previousGeometry.stepX~=geometry.stepX or previousGeometry.rowX~=geometry.rowX
+      or previousGeometry.rowY~=geometry.rowY)
+    local initialMask=migrate and persistedMask or mask
+    if saved then saved.mask=initialMask
+    else self.sessions[#self.sessions+1]={sprite=sprite,layer=layer,mask=initialMask} end
+    self.geometry=migrate and previousGeometry or geometry
+    self.overlap=overlap
+    self.cellWidth,self.cellHeight=cell.width,cell.height
+    binding = { sprite=sprite, layer=layer, frame=frame.frameNumber, mask=initialMask,copies=copies,
+      maskRows=json.encode(initialMask.rows),
       neighbors=neighbors,records=records,grid=findGrid(sprite,layer) }
     self.neighborModes=neighbors.modes
-    local prepared,problem=pcall(prepareCopies)
+    local prepared,problem=pcall(function()
+      if migrate then applyLayout(mask,geometry,overlap) else prepareCopies() end
+    end)
     if not prepared then detach();error(problem,0) end
+    self.overlapOverride=nil
     -- Снимаем готовый рисунок после изменения, обработчик только читает документ.
     attachBindingEvents()
     self.pendingTile=Hex.captureNative(sprite,layer,binding.frame,binding.mask)
@@ -712,7 +881,8 @@ function Hex.controller()
         end)
         if not ok then self.error="Не удалось восстановить Hex Repeat. Включи режим вручную.";return false end
         binding=candidate
-        self.geometry,self.repeatOn=saved.geometry,saved.repeatOn
+        self.geometry,self.repeatOn,self.overlap=saved.geometry,saved.repeatOn,saved.overlap
+        self.cellWidth,self.cellHeight=binding.mask.bounds.width,binding.mask.bounds.height
         self.gridOn,self.gridOpacity,self.gridSolid=saved.gridOn,saved.gridOpacity,saved.gridSolid
         binding.neighbors,binding.records=neighbors,records
         self.neighborModes=neighbors.modes
@@ -755,28 +925,7 @@ function Hex.controller()
     -- Сверяем также производный cel после Undo/Redo и ручных команд пользователя.
     if bytes == self.lastBytes and not dirty and self.renderedRepeat==self.repeatOn
       and self.renderedId==output.image.id then return false end
-    local image=transparentImage(binding.sprite,output.image.width,output.image.height)
-    if self.repeatOn then
-      local g,m=self.geometry,binding.mask
-      for i,p in ipairs(offsets(g)) do
-        if not self.neighborModes[i] then
-          image:drawImage(tile,Point(m.bounds.x+p[1]-output.position.x,
-            m.bounds.y+p[2]-output.position.y))
-        end
-      end
-      -- Копии не заполняют прозрачные отверстия центра и самостоятельных клеток.
-      local clear=binding.sprite.colorMode==ColorMode.INDEXED and binding.sprite.transparentColor or 0
-      local function clearMask(mask)
-        for y,row in ipairs(mask.rows) do
-          for _,x in ipairs(row) do image:drawPixel(mask.bounds.x+x-output.position.x,
-            mask.bounds.y+y-1-output.position.y,clear) end
-        end
-      end
-      clearMask(m)
-      for i,p in ipairs(offsets(g)) do
-        if self.neighborModes[i] then clearMask(neighborMask(m,p)) end
-      end
-    end
+    local image=copiesImage(tile,output)
     putDerived(output,image)
     self.renderedRepeat,self.renderedId=self.repeatOn,output.image.id
     self.tile, self.lastBytes = tile, bytes
@@ -917,9 +1066,9 @@ local dialog, timer
 local closing, busy = false, false
 local requested, restoreRequested, refreshRequested = nil, false, false
 local displayedMode, modeNeedsSync = false, false
-local pendingRepeat, pendingNeighbor, pendingGrid, pendingGridOpacity, pendingGridSolid
+local pendingRepeat, pendingNeighbor, pendingGrid, pendingGridOpacity, pendingGridSolid, pendingOverlap
 local displayedOpacity, displayedSolid, gridControlsVisible=50,false,true
-local displayedGeometry="24,12,14"
+local displayedGeometry,displayedOverlap="unbound",0
 local errorText = nil
 local displayedError, copyNote = nil, nil
 local errorScroll = 0
@@ -1061,14 +1210,19 @@ dialog = Dialog{ title="Hex Repeat", resizeable=true, onclose=cleanup }
 _G.hexRepeatPanel = dialog
 dialog:separator{ id="infoHeading", label="Информация гексагона", text="Опции" }
 dialog:newrow()
-dialog:check{ id="mode", label="Шаг X: 24", text="Режим Hex Repeat", selected=false,
+dialog:check{ id="mode", label="Шаг X: —", text="Режим Hex Repeat", selected=false,
   onclick=function() requested = dialog.data.mode; modeNeedsSync=true end }
 dialog:newrow()
-dialog:check{ id="repeatOn", label="Сдвиг ряда X: 12", text="Показывать повторы", selected=true,
+dialog:check{ id="repeatOn", label="Сдвиг ряда X: —", text="Показывать повторы", selected=true,
   onclick=function() pendingRepeat=dialog.data.repeatOn end }
 dialog:newrow()
-dialog:check{ id="gridOn", label="Шаг ряда Y: 14", text="Показывать сетку", selected=true,
+dialog:check{ id="gridOn", label="Шаг ряда Y: —", text="Показывать сетку", selected=true,
   onclick=function()pendingGrid=dialog.data.gridOn end }
+dialog:newrow()
+dialog:label{ id="overlapTitle", label="Размер: —", text="Наложение по вертикали, px", hexpand=false }
+dialog:samerow()
+dialog:slider{ id="overlap", min=0, max=7, value=0,
+  onchange=function()pendingOverlap=dialog.data.overlap end }
 dialog:newrow()
 dialog:check{ id="gridSolid", text="Сплошной контур", selected=false,
   onclick=function()pendingGridSolid=dialog.data.gridSolid end }
@@ -1127,6 +1281,13 @@ timer = Timer{ interval=0.1, ontick=function()
     if pendingRepeat~=nil then
       controller.setRepeats(pendingRepeat)
       pendingRepeat=nil
+    end
+    if pendingOverlap~=nil then
+      local value=pendingOverlap
+      pendingOverlap=nil
+      if not run(function()controller.setOverlap(value)end) then
+        dialog:modify{id="overlap",value=controller.overlap}
+      end
     end
     if pendingGrid~=nil then
       local show=pendingGrid
@@ -1191,13 +1352,19 @@ timer = Timer{ interval=0.1, ontick=function()
       dialog:modify{id="gridSolid",selected=solid}
     end
     -- Значения только поясняют текущую сетку, обработчиков ввода у них нет.
+    if displayedOverlap~=controller.overlap then
+      displayedOverlap=controller.overlap
+      dialog:modify{id="overlap",value=controller.overlap}
+    end
     local geometry=controller.geometry
-    local key=table.concat({geometry.stepX,geometry.rowX,geometry.rowY},",")
-    if displayedGeometry~=key then
+    local key=controller.cellWidth and table.concat({geometry.stepX,geometry.rowX,geometry.rowY,
+      controller.cellWidth,controller.cellHeight},",") or "unbound"
+    if displayedGeometry~=key and key~="unbound" then
       displayedGeometry=key
       dialog:modify{id="mode",label=string.format("Шаг X: %d",geometry.stepX)}
       dialog:modify{id="repeatOn",label=string.format("Сдвиг ряда X: %d",geometry.rowX)}
       dialog:modify{id="gridOn",label=string.format("Шаг ряда Y: %d",geometry.rowY)}
+      dialog:modify{id="overlapTitle",label=string.format("Размер: %d×%d",controller.cellWidth,controller.cellHeight)}
     end
     if displayedError~=errorText then
       displayedError=errorText
